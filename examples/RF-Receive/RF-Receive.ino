@@ -2,15 +2,21 @@
 #include <RFM69.h>
 #include <SPI.h>
 
-#define NODE_ID       1                  // 1 for gateway, other integers for nodes
-#define NETWORK_ID    76                 // the same on all nodes that talk to each other
+#define NETWORKID     0   // Must be the same for all nodes
+#define MYNODEID      2   // My node ID
+#define TONODEID      1   // Destination node ID
+
 #define FREQUENCY     RF69_868MHZ
 #define ENCRYPT_KEY   "3m0I0kubJa88BMjR" // exactly the same 16 characters/bytes on all nodes!
 #define SERIAL_BAUD   9600
 
+SPIClass spi;
+
 RFM69 radio(D8, D1, false, nullptr);
 
 void setup() {
+  spi.pins(14, 12, 13, 15);
+
   Serial.begin(SERIAL_BAUD);
   Serial.println();
   delay(10);
@@ -18,8 +24,16 @@ void setup() {
   WiFi.mode(WIFI_OFF);
   delay(10);
   
-  radio.initialize(FREQUENCY, NODE_ID, NETWORK_ID);
-  radio.encrypt(ENCRYPT_KEY);
+  if(radio.initialize(FREQUENCY, MYNODEID, NETWORKID) == true)
+  {
+    Serial.println("initialize is true");
+  }
+  else
+  {
+    Serial.println("initialize is false");
+  }
+
+  //radio.encrypt(ENCRYPT_KEY);
   Serial.print("Frequency [Hz]: ");
   Serial.println(radio.getFrequency());
   Serial.print("Power [dB]: ");

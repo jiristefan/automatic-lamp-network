@@ -21,19 +21,27 @@
 #define NTP_DAYLIGHT_SAVINGS_OFFSET 3600  // 3600 in summer, 0 in winter
 #define NTP_SYNC_INTERVAL 60              // seconds
 
+#define RADIO_NODE_ID 2  // Node ID used for node identification over the radio (0 is for broadcast, 1 is for gateway, 2+ are for nodes)
 #define RADIO_GATEWAY_ID 1  // 1 for gateway, other integers for nodes
-#define RADIO_NETWORK_ID 76  // The same on all nodes that talk to each other
+#define RADIO_NETWORK_ID 0  // The same on all nodes that talk to each other
 #define RADIO_FREQUENCY RF69_868MHZ
 #define RADIO_ENCRYPT_KEY "3m0I0kubJa88BMjR"  // Exactly the same 16 characters on all nodes
 
 #define BAUD_RATE 9600
 #define MAX_NUMBER_OF_LAMPS 10
-#define MESSAGE_SIZE_IN_BYTES 5
-
-
+#define MESSAGE_SIZE_IN_BYTES 8
+#define MESSAGE_PAYLOAD_SIZE_IN_BYTES 5
+#define LAMP_PIN LED_BUILTIN
+#define RFM_SEND_NUMBER_OF_RETRIES 10
+#define RFM_SEND_WAIT_RETRY_WAIT_TIME 10
+#define MAX_NUMBER_OF_EVENTS 10
+#define CHECK_TIMER_INTERVAL_MS 60000
+#define MSG_QUEUE_SIZE 100
+#define STARTING_LAMP_ID 2
 // Types
 // -------------------------------------
 typedef enum {
+  MSG_NOT_INITIALIZED,
   STATUS_REQUEST,   // GATEWAY LampID
   SET_MODE,         // GATEWAY LampID, value_1 = LampMode
   SET_TIME,         // GATEWAY LampID, value_1 = hours, value_2 = minutes, value_3 = seconds
@@ -41,6 +49,9 @@ typedef enum {
   LIGHT_STATUS,     // NODE    LampID, value_1 = LightStatus
   MOTION_STATUS,    // NODE    LampID, value_1 = MotionStatus
   SUN_STATUS,       // NODE    LampID, value_1 = uint8_t
+  SET_EVENT,        // value_1 = hours, value_2 = minutes, value_3 = seconds, value_4 = lamp on/off 
+  REQUEST_FOR_TIME_UPDATE,
+  REQUEST_FOR_EVENTS,
   NUMBER_OF_MESSAGE_TYPES,
 } MessageType;
 
@@ -52,6 +63,7 @@ typedef enum {
 } LampMode;
 
 typedef enum {
+  LIGHT_NOT_INITIALIZED,
   LIGHT_ON,
   LIGHT_OFF,
   NUMBER_LIGHT_STATUSES,
@@ -71,9 +83,32 @@ typedef struct lamp {
   uint8_t sun_value = -1;
 } Lamp;
 
+typedef struct time {
+  uint8_t hours = 100;
+  uint8_t minutes = 100;
+  uint8_t seconds = 100;
+} Time;
+
+typedef struct event
+{
+  Time time;
+  LightStatus lamp_state = LIGHT_NOT_INITIALIZED;
+} Event;
+
+typedef struct message {
+  MessageType type = MSG_NOT_INITIALIZED;
+  uint8_t source_id = 0;
+  uint8_t target_id = 0;
+  uint8_t payload[MESSAGE_SIZE_IN_BYTES] = {0};
+} Message;
 
 // Global variables
 // -------------------------------------
+uint32_t print_counter = 0;
+uint32_t update_time_counter = 0;
+
+Message msg_queue[MSG_QUEUE_SIZE];
+uint8_t msg_queue_index = 0;
 
 // WiFi
 ESP8266WebServer server(80);
@@ -88,7 +123,7 @@ Ticker ntp_time_update;
 RFM69 radio(D8, D1, false, nullptr);
 
 Lamp lamp_database[MAX_NUMBER_OF_LAMPS];
-
+Event time_plan[MAX_NUMBER_OF_EVENTS];
 
 // Functions
 // -------------------------------------
@@ -124,7 +159,8 @@ void handle_status_request(String request) {
   redirect_to_root();
   if (request.indexOf("/status") >= 0) {
     // Send status request message to all IDs to register existing lamps
-    broadcast_message(STATUS_REQUEST, 0, 0, 0, 0);
+    Message msg={.type=STATUS_REQUEST, .source_id=RADIO_GATEWAY_ID, .target_id=0, .payload={0, 0, 0, 0, 0}};
+    broadcast_message(msg);
   }
 }
 
@@ -168,9 +204,10 @@ void handle_mode_switch(String request) {
   // If command to change mode of all lamps was given
   if (id_string[0] == 'A') {
     // Loop through every lamp in database and broadcast the new mode to it
-    for (uint8_t id = 0; id < MAX_NUMBER_OF_LAMPS; id++) {
+    for (uint8_t id = STARTING_LAMP_ID; id < MAX_NUMBER_OF_LAMPS; id++) {
       if (lamp_database[id].is_registered) {
-        send_message(SET_MODE, id, (uint8_t)lamp_mode, 0, 0);
+        Message msg={.type=SET_MODE, .source_id=RADIO_GATEWAY_ID, .target_id=id, .payload={(uint8_t)lamp_mode, 0, 0, 0, 0}};
+        add_message_to_queue(msg);
       }
     }
     return;
@@ -191,7 +228,8 @@ void handle_mode_switch(String request) {
     return;
   }
 
-  send_message(SET_MODE, lamp_id, (uint8_t)lamp_mode, 0, 0);
+  Message msg={.type=SET_MODE, .source_id=RADIO_GATEWAY_ID, .target_id=lamp_id, .payload={(uint8_t)lamp_mode, 0, 0, 0, 0}};
+  add_message_to_queue(msg);
 }
 
 
@@ -342,7 +380,7 @@ void ICACHE_RAM_ATTR sendPage() {
 
               "<center>");
 
-  for (int id = 0; id < MAX_NUMBER_OF_LAMPS; id++) {
+  for (int id = STARTING_LAMP_ID; id < MAX_NUMBER_OF_LAMPS; id++) {
     if (lamp_database[id].is_registered) {
       page.concat("<div class=\"lamp\">");
       page.concat("<b>Lamp " + String(id + 1) + "</b>");
@@ -399,9 +437,14 @@ void ICACHE_RAM_ATTR sendPage() {
 /*
  * Prints formatted message to console.
  */
-void print_message(MessageType type, uint8_t id, uint8_t value_1, uint8_t value_2, uint8_t value_3) {
+void print_message(Message message) {
   String type_str;
-  switch (type) {
+  switch (message.type) {
+    case MSG_NOT_INITIALIZED:
+      {
+        type_str = "MSG_NOT_INITIALIZED";
+        break;
+      }
     case STATUS_REQUEST:
       {
         type_str = "STATUS_REQUEST";
@@ -437,15 +480,68 @@ void print_message(MessageType type, uint8_t id, uint8_t value_1, uint8_t value_
         type_str = "SUN_STATUS";
         break;
       }
+    case SET_EVENT:
+      {
+        type_str = "SET_EVENT";
+        break;
+      }
+    case REQUEST_FOR_TIME_UPDATE:
+      {
+        type_str = "REQUEST_FOR_TIME_UPDATE";
+        break;
+      }
+    case REQUEST_FOR_EVENTS:
+      {
+        type_str = "REQUEST_FOR_EVENTS";
+        break;
+      }
     default:
       {
-        type_str = "UNKNOWN";
+        type_str = "UNKNOWN, value: "+String(message.type);
         break;
       }
   }
-  Serial.println(type_str + ", ID: " + String((int)id) + ", Value: " + String((int)value_1) + " " + String((int)value_2) + " " + String((int)value_3));
+  Serial.print(type_str + ", Source ID: " + String((int)message.source_id) + ", Target ID: "+String((int)message.target_id) +", Payload: ");
+  for (uint16_t i = 0;i<MESSAGE_PAYLOAD_SIZE_IN_BYTES;i++)
+  {
+    Serial.print(String((int)message.payload[i]) + ", ");
+  }
+  Serial.print("\n\r");
 }
 
+void print_time_plan()
+{
+  Serial.println("printing time plan:");
+  for(uint8_t i = 0;i<MAX_NUMBER_OF_EVENTS;i++)
+  {
+    Serial.print("Index: "+String((int)i)+", hour: "+String((int)time_plan[i].time.hours)+", minute "+String((int)time_plan[i].time.minutes)+", second "+String((int)time_plan[i].time.seconds)+", lamp state: ");
+    String lamp_str = "Unknown lamp state";
+    switch(time_plan[i].lamp_state) 
+    {
+      case LIGHT_NOT_INITIALIZED:
+      {
+        lamp_str = "LIGHT_NOT_INITIALIZED";
+        break;
+      }
+      case LIGHT_ON:
+      {
+        lamp_str = "LIGHT_ON";
+        break;
+      }
+      case LIGHT_OFF:
+      {
+        lamp_str = "LIGHT_OFF";
+        break;
+      }
+      case NUMBER_LIGHT_STATUSES:
+      {
+        lamp_str = "NUMBER_LIGHT_STATUSES";
+        break;
+      }
+    }
+    Serial.print(lamp_str+"\n\r");
+  }
+}
 
 /*
  * Resets the specified entry of the global database of lamps.
@@ -462,75 +558,123 @@ void reset_database_entry(uint8_t id) {
 /*
  * Updates the specified entry of the global database of lamps according to received radio message.
  */
-void update_database(MessageType type, uint8_t id, uint8_t value_1, uint8_t value_2, uint8_t value_3) {
-  Serial.print("[INFO] Message received: ");
-  print_message(type, id, value_1, value_2, value_3);
-
-  if (id >= MAX_NUMBER_OF_LAMPS) {
-    Serial.println("[ERROR] Tried to access lamp with invalid ID: " + String((int)id));
+void update_database(Message message) {
+  Serial.println("updating database");
+  if (message.source_id >= MAX_NUMBER_OF_LAMPS) {
+    Serial.println("[ERROR] Tried to access lamp with invalid source ID: " + String((int)message.source_id));
     return;
   }
 
   // Message from unregistered lamp ID erases the database entry and enables the lamp
-  if (lamp_database[id].is_registered == false) {
-    reset_database_entry(id);
-    lamp_database[id].is_registered = true;
+  if (lamp_database[message.source_id].is_registered == false) {
+    Serial.println("id "+String(message.source_id) + " is newly registered, sending time plan");
+    for(uint8_t i = 0;i<MAX_NUMBER_OF_EVENTS;i++)
+    {
+      if(time_plan[i].lamp_state != LIGHT_NOT_INITIALIZED)
+      {
+        Message msg={.type=SET_EVENT, .source_id = RADIO_GATEWAY_ID, .target_id=message.source_id, .payload={time_plan[i].time.hours, time_plan[i].time.minutes, time_plan[i].time.seconds, time_plan[i].lamp_state, i}};
+        add_message_to_queue(msg);
+      }
+    }
+
+    reset_database_entry(message.source_id);
+    lamp_database[message.source_id].is_registered = true;
+  }
+  
+  if (message.type == MODE_STATUS)
+  {
+    lamp_database[message.source_id].lamp_mode = (LampMode)message.payload[0];
+  } 
+  else if (message.type == LIGHT_STATUS) 
+  {
+    lamp_database[message.source_id].light_status = (LightStatus)message.payload[0];
+  } 
+  else if (message.type == MOTION_STATUS) 
+  {
+    lamp_database[message.source_id].motion_status = (MotionStatus)message.payload[0];
+  } 
+  else if (message.type == SUN_STATUS) 
+  {
+    lamp_database[message.source_id].sun_value = message.payload[0];
+  }
+  else if (message.type == REQUEST_FOR_EVENTS)
+  {
+    for(uint8_t i = 0;i<MAX_NUMBER_OF_EVENTS;i++)
+    {
+      if(time_plan[i].lamp_state != LIGHT_NOT_INITIALIZED)
+      {      
+        Message msg={.type=SET_EVENT, .source_id = RADIO_GATEWAY_ID, .target_id=message.source_id, .payload={time_plan[i].time.hours, time_plan[i].time.minutes, time_plan[i].time.seconds, time_plan[i].lamp_state, i}};
+        add_message_to_queue(msg);
+      }
+    }
+  }
+  else if(message.type == REQUEST_FOR_TIME_UPDATE)
+  {
+    Message msg={.type=SET_TIME, .source_id=RADIO_GATEWAY_ID, .target_id=message.source_id, .payload={(uint8_t)timeClient.getHours(), (uint8_t)timeClient.getMinutes(), (uint8_t)timeClient.getSeconds(), 0}};
+    add_message_to_queue(msg);
   }
 
-  if (type == MODE_STATUS) {
-    lamp_database[id].lamp_mode = (LampMode)value_1;
-  } else if (type == LIGHT_STATUS) {
-    lamp_database[id].light_status = (LightStatus)value_1;
-  } else if (type == MOTION_STATUS) {
-    lamp_database[id].motion_status = (MotionStatus)value_1;
-  } else if (type == SUN_STATUS) {
-    lamp_database[id].sun_value = value_1;
-  } else {
+  else 
+  {
     Serial.println("[ERROR] Received unsupported message from a node: ");
-    print_message(type, id, value_1, value_2, value_3);
+    print_message(message);
   }
 }
 
+uint8_t add_message_to_queue(Message message)
+{
+  Serial.println("msg queue index: "+String(msg_queue_index));
+  if(msg_queue_index >= MSG_QUEUE_SIZE)
+  {
+    return -1;
+  }
+
+  msg_queue[msg_queue_index] = message;
+  msg_queue_index++;
+  return 0;
+}
 
 /*
  * This function constructs a message and sends it using the radio module.
  */
-void send_message(MessageType type, uint8_t id, uint8_t value_1, uint8_t value_2, uint8_t value_3) {
-  uint8_t data[MESSAGE_SIZE_IN_BYTES];
+void send_message(Message message) {
 
-  // Adding data to the array
-  data[0] = type;
-  data[1] = id;
-  data[2] = value_1;
-  data[3] = value_2;
-  data[4] = value_3;
-
-  // Send message (radio ID has to be offset by 2, as 0 is for broadcast and 1 is for gateway)
-  radio.send(id + 2, data, MESSAGE_SIZE_IN_BYTES);
+  // Send message to gateway
+  uint8_t buf[MESSAGE_SIZE_IN_BYTES] = {0};
+  buf[0] = message.type;
+  buf[1] = message.source_id;
+  buf[2] = message.target_id;
+  uint8_t header_size = MESSAGE_SIZE_IN_BYTES - MESSAGE_PAYLOAD_SIZE_IN_BYTES;
+  for(uint8_t i = 0;i<MESSAGE_PAYLOAD_SIZE_IN_BYTES;i++)
+  {
+    buf[i + header_size] = message.payload[i];
+  }
+  radio.sendWithRetry(message.target_id, buf, MESSAGE_SIZE_IN_BYTES);
 
   Serial.print("[INFO] Message Sent: ");
-  print_message(type, id, value_1, value_2, value_3);
+  print_message(message);
 }
-
 
 /*
  * This function constructs a message and sends it to all nodes (NODE_ID == 0).
  */
-void broadcast_message(MessageType type, uint8_t id, uint8_t value_1, uint8_t value_2, uint8_t value_3) {
-  uint8_t data[MESSAGE_SIZE_IN_BYTES];
+void broadcast_message(Message message) {
+  Message message_copy = message;
+  for(uint8_t i = STARTING_LAMP_ID;i<MAX_NUMBER_OF_LAMPS;i++)
+  {
+    message_copy.target_id=i;
+    add_message_to_queue(message_copy);
+    // Receive Radio message
+    delay(10);
 
-  // Adding data to the array
-  data[0] = type;
-  data[1] = id;
-  data[2] = value_1;
-  data[3] = value_2;
-  data[4] = value_3;
-
-  // Send message
-  radio.send(0, data, MESSAGE_SIZE_IN_BYTES);
-
-  Serial.print("[INFO] Message Broadcasted: ");
-  print_message(type, id, value_1, value_2, value_3);
+    for(uint8_t i = 0;i<5;i++)
+    {
+      Message message = receive_message();
+      if (message.type != MSG_NOT_INITIALIZED) {
+        update_database(message);
+      }
+    }
+  }
 }
 
 
@@ -538,28 +682,45 @@ void broadcast_message(MessageType type, uint8_t id, uint8_t value_1, uint8_t va
  * Receives radio message.
  * Returns nullptr if nothing was received or uint8_t list with received data.
  */
-uint8_t* receive_message() {
+Message receive_message() {
+  
   if (radio.receiveDone()) {
+    Message msg;  
     uint8_t* data = radio.DATA;
     uint8_t message_length = radio.DATALEN;
+    
     // Check if sender wanted an ACK
     if (radio.ACKRequested()) {
       radio.sendACK();
     }
-
     // If message does not have correct size
     if (message_length != MESSAGE_SIZE_IN_BYTES) {
       Serial.print("[ERROR] Received message with wrong size: ");
       Serial.print(message_length);
       Serial.print(", should be ");
       Serial.println(MESSAGE_SIZE_IN_BYTES);
-      return nullptr;
+      return msg;
     }
 
-    return data;
+    msg.type = (MessageType) data[0];
+    msg.source_id = data[1];
+    msg.target_id = data[2];
+
+    uint8_t header_size = MESSAGE_SIZE_IN_BYTES - MESSAGE_PAYLOAD_SIZE_IN_BYTES;
+
+    for(uint8_t i = 0;i<MESSAGE_PAYLOAD_SIZE_IN_BYTES;i++)
+    {
+      msg.payload[i] = data[header_size+i];
+    }
+
+    Serial.print("[INFO] Message received: ");
+    print_message(msg);
+
+    return msg;
   }
   else {
-    return nullptr;
+    Message msg;  
+    return msg;
   }
 }
 
@@ -598,33 +759,80 @@ void setup() {
 
   // Init Radio
   radio.initialize(RADIO_FREQUENCY, RADIO_GATEWAY_ID, RADIO_NETWORK_ID);
-  radio.encrypt(RADIO_ENCRYPT_KEY);
+  //radio.encrypt(RADIO_ENCRYPT_KEY);
   delay(10);
 
-  // Send status request message to all IDs to register existing lamps
-  broadcast_message(STATUS_REQUEST, 0, 0, 0, 0);
-}
+  time_plan[0].time.hours = 20;
+  time_plan[0].time.minutes = 32;
+  time_plan[0].time.seconds = 0;
+  time_plan[0].lamp_state = (LightStatus) LIGHT_ON;
 
+  time_plan[1].time.hours = 20;
+  time_plan[1].time.minutes = 33;
+  time_plan[1].time.seconds = 0;
+  time_plan[1].lamp_state = (LightStatus) LIGHT_OFF;
+
+  time_plan[2].time.hours = 20;
+  time_plan[2].time.minutes = 34;
+  time_plan[2].time.seconds = 0;
+  time_plan[2].lamp_state = (LightStatus) LIGHT_ON;
+  
+  // Send status request message to all IDs to register existing lamps
+  Message msg={.type=STATUS_REQUEST, .source_id = RADIO_GATEWAY_ID, .target_id=0, .payload={0, 0, 0, 0, 0}};
+  broadcast_message(msg);
+}
 
 void loop() {
 
+  if(msg_queue_index!=0)
+  {
+    send_message(msg_queue[0]);
+    for(uint8_t i = 0;i<msg_queue_index;i++)
+    {
+      msg_queue[i] = msg_queue[i+1];
+    }
+    msg_queue_index--;
+  }
+
+  print_counter++;
+  if(print_counter%100000==0)
+  {
+    /*update_time_counter++;
+    if(update_time_counter%10 == 0)
+    {
+      should_update_time = true;
+    }*/
+    print_time_plan();
+
+    Serial.println("current time: "+String(timeClient.getHours()) + ":"+ String(timeClient.getMinutes()) + ":"+ String(timeClient.getSeconds()));
+
+  }
+
   // NTP time update
-  if (should_update_time) {
-    should_update_time = false;
+  if (should_update_time == true) {
     timeClient.update();
-    for (int id = 0; id < MAX_NUMBER_OF_LAMPS; id++) {
+    Serial.println("Sending Time: "+String(timeClient.getHours()) + ":"+ String(timeClient.getMinutes()) + ":"+ String(timeClient.getSeconds()));
+    should_update_time = false;
+    for (int id = STARTING_LAMP_ID; id < MAX_NUMBER_OF_LAMPS; id++) {
+      Serial.print("ID: "+String(id));
       if (lamp_database[id].is_registered) {
-        send_message(SET_TIME, id, (uint8_t)timeClient.getHours(), (uint8_t)timeClient.getMinutes(), (uint8_t)timeClient.getSeconds());
+        Serial.print(" is registered, sending message");
+        Message msg={.type=SET_TIME, .source_id=RADIO_GATEWAY_ID, .target_id=id, .payload={(uint8_t)timeClient.getHours(), (uint8_t)timeClient.getMinutes(), (uint8_t)timeClient.getSeconds(), 0}};
+        add_message_to_queue(msg);
+      }
+      else
+      {
+        Serial.print(" is not registered\n\r");
       }
     }
   }
-
+  
   // Receive Radio message
-  uint8_t* message = receive_message();
-  if (message != nullptr) {
-    update_database((MessageType)message[0], message[1], message[2], message[3], message[4]);
+  Message message = receive_message();
+  if (message.type != MSG_NOT_INITIALIZED) {
+    update_database(message);
   }
-
+  
   // Handle HTTP requests
   server.handleClient();
 }
