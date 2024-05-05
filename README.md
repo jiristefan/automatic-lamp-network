@@ -1,9 +1,9 @@
 # Outdoor Lamp Mesh Network
 
-Test setup:
+Test setup:  
 ![alt text](./img/mesh-photo.jpg)
 
-Web UI:
+Web UI:  
 ![alt text](./img/web-gui.png)
 
 ## Radio module RFM69HW
